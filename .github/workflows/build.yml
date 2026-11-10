@@ -1,0 +1,61 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -Recurse "build/ReferenceAB_artefacts/Release/VST3/Reference AB.vst3" dist/
+          Copy-Item docs/INSTALL.txt dist/
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist
+          cp -R "build/ReferenceAB_artefacts/Release/VST3/Reference AB.vst3" dist/
+          codesign --force --deep --sign - "dist/Reference AB.vst3"
+          lipo -archs "dist/Reference AB.vst3/Contents/MacOS/Reference AB"
+          cp docs/INSTALL.txt dist/
+          # Keep the bundle intact inside the artifact (permissions, signature).
+          cd dist && ditto -c -k --keepParent "Reference AB.vst3" "Reference AB.vst3.zip" && rm -rf "Reference AB.vst3"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReferenceAB-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
