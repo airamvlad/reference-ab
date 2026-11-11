@@ -150,8 +150,12 @@ int main()
         setParameter (processor, "band", (float) ReferenceABProcessor::bandFull);
 
         // Loop region: playback stays inside it.
-        track->loopStart.store (0.25);
-        track->loopEnd.store (0.5);
+        processor.setLoopRegion (0, 0.25, 0.5);
+
+        for (int i = 0; i < 200 && track->regionLufs.load() < -70.0f; ++i)
+            juce::Thread::sleep (10);
+
+        expectNear ("loop region loudness measured (LUFS)", track->regionLufs.load(), -10.0, 0.2);
         processor.seek (0.25);
         run (processor, hostRate, 4.0, -20.0, phase);
         const double position = (double) processor.getPosition (0) / (double) track->getNumSamples();
@@ -249,6 +253,17 @@ int main()
 
         // White noise must rise 3 dB per octave on the pink-flat display.
         expectNear ("white noise slope, 1 kHz to 8 kHz (dB)", ref.spectrumDb[104] - ref.spectrumDb[68], 9.0, 1.5);
+        expectNear ("live spectrum close to the average at 1 kHz (dB)", ref.fastDb[68] - ref.spectrumDb[68], 0.0, 3.0);
+
+        {
+            float scopePeak = 0.0f;
+
+            for (const float v : snapshot->scopeRight)
+                scopePeak = juce::jmax (scopePeak, std::abs (v));
+
+            expect ("goniometer receives samples", scopePeak > 0.01f && scopePeak < 0.2f);
+        }
+
         expect ("mix punch (PSR) measured", processor.mixMeter.getPsr() > 3.0f && processor.mixMeter.getPsr() < 25.0f);
 
         // Optional: REFERENCEAB_SNAPSHOT=/path/to.png saves a picture of the editor

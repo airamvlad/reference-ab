@@ -3,6 +3,29 @@
 
 #include <juce_dsp/juce_dsp.h>
 
+float ReferenceTrack::measureLoudness (double start, double end) const
+{
+    const int length = audio.getNumSamples();
+    const int first = juce::jlimit (0, length, (int) (start * (double) length));
+    const int last = juce::jlimit (0, length, (int) (end * (double) length));
+
+    if (last - first < (int) sampleRate)       // under a second is too short to measure
+        return LoudnessMeter::silence;
+
+    const int chunk = 4096;
+    LoudnessMeter meter;
+    meter.prepare (sampleRate, 2, chunk);
+
+    for (int position = first; position < last; position += chunk)
+    {
+        const int num = juce::jmin (chunk, last - position);
+        juce::AudioBuffer<float> view (const_cast<float* const*> (audio.getArrayOfReadPointers()), 2, position, num);
+        meter.process (view, num);
+    }
+
+    return meter.getIntegrated();
+}
+
 ReferenceTrack::Ptr ReferenceTrack::placeholder (const juce::File& fileToUse)
 {
     Ptr track (new ReferenceTrack());

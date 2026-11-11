@@ -93,6 +93,7 @@ void Analyzer::prepare (double newSampleRate)
 {
     sampleRate = newSampleRate > 0.0 ? newSampleRate : 48000.0;
     framesForAverage = juce::jmax (4, (int) (averagingSeconds * sampleRate / hopSize));
+    fastAlpha = (float) (1.0 - std::exp (-(double) hopSize / (sampleRate * 0.2)));
     reset();
 }
 
@@ -104,6 +105,7 @@ void Analyzer::reset()
     left.fill (0.0f);
     right.fill (0.0f);
     cross.fill (0.0f);
+    fast.fill (0.0f);
     frames = 0;
     resetRequested.store (false);
 
@@ -174,6 +176,7 @@ void Analyzer::processFrame()
         left[(size_t) bin]  += alpha * ((lr * lr + li * li) * scale - left[(size_t) bin]);
         right[(size_t) bin] += alpha * ((rr * rr + ri * ri) * scale - right[(size_t) bin]);
         cross[(size_t) bin] += alpha * ((lr * rr + li * ri) * scale - cross[(size_t) bin]);
+        fast[(size_t) bin]  += fastAlpha * (0.5f * (lr * lr + li * li + rr * rr + ri * ri) * scale - fast[(size_t) bin]);
     }
 
     const juce::SpinLock::ScopedTryLockType lock (publishLock);
@@ -183,6 +186,14 @@ void Analyzer::processFrame()
         published.left = left;
         published.right = right;
         published.cross = cross;
+        published.fast = fast;
+
+        // The newest half of the frame, every second sample, for the goniometer.
+        for (int i = 0; i < scopePoints; ++i)
+        {
+            published.scopeLeft[(size_t) i] = fifoLeft[(size_t) (hopSize + 2 * i)];
+            published.scopeRight[(size_t) i] = fifoRight[(size_t) (hopSize + 2 * i)];
+        }
         published.sampleRate = sampleRate;
         published.valid = frames >= 2;
     }
@@ -234,11 +245,14 @@ void Analyzer::analyse (const Snapshot& snapshot, Result& result)
         if (low >= top)
         {
             result.spectrumDb[(size_t) i] = -200.0f;
+            result.fastDb[(size_t) i] = -200.0f;
             continue;
         }
 
         const double power = meanPower (total, binHz, low, high) * numBinsInRange / totalPower;
-        result.spectrumDb[(size_t) i] = toDb (power) + (float) (10.0 * std::log10 (frequency / 1000.0));
+        const auto tilt = (float) (10.0 * std::log10 (frequency / 1000.0));
+        result.spectrumDb[(size_t) i] = toDb (power) + tilt;
+        result.fastDb[(size_t) i] = toDb (meanPower (snapshot.fast, binHz, low, high) * numBinsInRange / totalPower) + tilt;
     }
 
     const auto& toneEdges = toneBandEdges();
