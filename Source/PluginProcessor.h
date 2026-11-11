@@ -3,6 +3,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_dsp/juce_dsp.h>
 
+#include "Analyzer.h"
 #include "LoudnessMeter.h"
 #include "ReferenceTrack.h"
 
@@ -73,6 +74,10 @@ public:
 
     juce::AudioProcessorValueTreeState apvts;
     LoudnessMeter mixMeter, refMeter;
+    Analyzer mixAnalyzer, refAnalyzer;
+
+    /** Clears all measurements (meters and analysis). */
+    void resetMeasurements();
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();

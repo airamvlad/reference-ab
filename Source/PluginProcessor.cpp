@@ -67,6 +67,8 @@ void ReferenceABProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
 
     mixMeter.prepare (sampleRate, 2, maxBlockSize);
     refMeter.prepare (sampleRate, 2, maxBlockSize);
+    mixAnalyzer.prepare (sampleRate);
+    refAnalyzer.prepare (sampleRate);
     refBuffer.setSize (2, maxBlockSize);
     refBuffer.clear();
 
@@ -98,6 +100,14 @@ void ReferenceABProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
 }
 
 void ReferenceABProcessor::releaseResources() {}
+
+void ReferenceABProcessor::resetMeasurements()
+{
+    mixMeter.requestReset();
+    refMeter.requestReset();
+    mixAnalyzer.requestReset();
+    refAnalyzer.requestReset();
+}
 
 //==============================================================================
 bool ReferenceABProcessor::renderReference (int slot, int numSamples, bool playing, bool useLoop,
@@ -178,6 +188,7 @@ void ReferenceABProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
 
     // The mix is always measured, also while the reference is being heard.
     mixMeter.process (buffer, numSamples);
+    mixAnalyzer.process (buffer, numSamples);
 
     if (refBuffer.getNumSamples() < numSamples)
         refBuffer.setSize (2, numSamples, false, false, true);
@@ -225,6 +236,7 @@ void ReferenceABProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
                 {
                     audioSlot = desiredSlot;
                     refMeter.requestReset();
+                    refAnalyzer.requestReset();
                 }
 
                 if (seek >= 0.0 && seekRequest.compare_exchange_strong (seek, -1.0))
@@ -247,7 +259,10 @@ void ReferenceABProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     }
 
     if (rendered)
+    {
         refMeter.process (refBuffer, numSamples);
+        refAnalyzer.process (refBuffer, numSamples);
+    }
 
     // Reference gain: manual trim plus automatic loudness matching to the mix.
     float gainDb = trimParam->load();

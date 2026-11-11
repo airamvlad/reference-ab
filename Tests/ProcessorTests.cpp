@@ -157,18 +157,6 @@ int main()
         const double position = (double) processor.getPosition (0) / (double) track->getNumSamples();
         expect ("playback stays inside loop region", position >= 0.25 && position < 0.5);
 
-        // Optional: REFERENCEAB_SNAPSHOT=/path/to.png saves a picture of the editor.
-        if (const auto snapshotPath = juce::SystemStats::getEnvironmentVariable ("REFERENCEAB_SNAPSHOT", {}); snapshotPath.isNotEmpty())
-        {
-            std::unique_ptr<juce::AudioProcessorEditor> editor (processor.createEditor());
-            const auto image = editor->createComponentSnapshot (editor->getLocalBounds(), true, 2.0f);
-            const juce::File target (snapshotPath);
-            target.deleteFile();
-
-            if (auto stream = target.createOutputStream())
-                juce::PNGImageFormat().writeImageToStream (image, *stream);
-        }
-
         // Back to A.
         setParameter (processor, "ab", 0.0f);
         peak = run (processor, hostRate, 1.0, -20.0, phase);
@@ -193,6 +181,91 @@ int main()
         }
 
         expect ("restored level match setting", restored.apvts.getRawParameterValue ("match")->load() < 0.5f);
+    }
+
+    {
+        // Analysis: a mono, bass-heavy "mix" against a wide, flat reference.
+        std::printf ("-- analysis\n");
+        juce::Random random (1234);
+        const int length = (int) (44100.0 * 8.0);
+        juce::AudioBuffer<float> noise (2, length);
+
+        for (int i = 0; i < length; ++i)
+        {
+            const float a = random.nextFloat() * 0.2f - 0.1f, b = random.nextFloat() * 0.2f - 0.1f;
+            noise.setSample (0, i, a);
+            noise.setSample (1, i, 0.5f * a + 0.87f * b);
+        }
+
+        const auto noiseFile = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                   .getNonexistentChildFile ("referenceab-noise", ".wav");
+        {
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> stream = noiseFile.createOutputStream();
+            const auto options = juce::AudioFormatWriterOptions().withSampleRate (44100.0).withNumChannels (2).withBitsPerSample (24);
+
+            if (auto writer = wav.createWriterFor (stream, options))
+                writer->writeFromAudioSampleBuffer (noise, 0, length);
+        }
+
+        ReferenceABProcessor processor;
+        processor.setPlayConfigDetails (2, 2, hostRate, 512);
+        processor.prepareToPlay (hostRate, 512);
+        processor.loadFile (0, noiseFile);
+        expect ("noise reference loads", waitForTrack (processor, 0));
+
+        juce::AudioBuffer<float> buffer (2, 512);
+        juce::MidiBuffer midi;
+        float lowpassed = 0.0f;
+
+        for (int block = 0; block < (int) (hostRate * 8.0 / 512.0); ++block)
+        {
+            for (int i = 0; i < 512; ++i)
+            {
+                const float white = random.nextFloat() * 0.2f - 0.1f;
+                lowpassed += 0.02f * (white - lowpassed);       // about 150 Hz
+                const float v = 0.5f * white + 4.0f * lowpassed;
+                buffer.setSample (0, i, v);
+                buffer.setSample (1, i, v);
+            }
+
+            processor.processBlock (buffer, midi);
+        }
+
+        auto snapshot = std::make_unique<Analyzer::Snapshot>();
+        Analyzer::Result mix, ref;
+        processor.mixAnalyzer.getSnapshot (*snapshot);
+        Analyzer::analyse (*snapshot, mix);
+        processor.refAnalyzer.getSnapshot (*snapshot);
+        Analyzer::analyse (*snapshot, ref);
+
+        expect ("mix and reference analysed", mix.valid && ref.valid);
+        expect ("bass-heavy mix shows more bass", mix.toneDb[1] - ref.toneDb[1] > 3.0f);
+        expect ("bass-heavy mix shows less air", mix.toneDb[4] - ref.toneDb[4] < -1.5f);
+        expectNear ("mono mix correlation", mix.correlation, 1.0, 0.01);
+        expectNear ("mono mix side energy (%)", mix.sideTotalPercent, 0.0, 0.5);
+        expect ("wide reference has side energy", ref.sideTotalPercent > 15.0f && ref.sideTotalPercent < 40.0f);
+        expectNear ("reference correlation", ref.correlation, 0.5, 0.05);
+
+        // White noise must rise 3 dB per octave on the pink-flat display.
+        expectNear ("white noise slope, 1 kHz to 8 kHz (dB)", ref.spectrumDb[104] - ref.spectrumDb[68], 9.0, 1.5);
+        expect ("mix punch (PSR) measured", processor.mixMeter.getPsr() > 3.0f && processor.mixMeter.getPsr() < 25.0f);
+
+        // Optional: REFERENCEAB_SNAPSHOT=/path/to.png saves a picture of the editor
+        // (REFERENCEAB_TAB=0..2 picks the analysis tab).
+        if (const auto snapshotPath = juce::SystemStats::getEnvironmentVariable ("REFERENCEAB_SNAPSHOT", {}); snapshotPath.isNotEmpty())
+        {
+            processor.apvts.state.setProperty ("analysisTab", juce::SystemStats::getEnvironmentVariable ("REFERENCEAB_TAB", "0").getIntValue(), nullptr);
+            std::unique_ptr<juce::AudioProcessorEditor> editor (processor.createEditor());
+            const auto image = editor->createComponentSnapshot (editor->getLocalBounds(), true, 2.0f);
+            const juce::File target (snapshotPath);
+            target.deleteFile();
+
+            if (auto stream = target.createOutputStream())
+                juce::PNGImageFormat().writeImageToStream (image, *stream);
+        }
+
+        noiseFile.deleteFile();
     }
 
     file.deleteFile();

@@ -43,6 +43,16 @@ public:
     float getRange() const noexcept             { return range.load(); }
     float getTruePeakDb() const noexcept        { return truePeakDb.load(); }
 
+    /** Peak to short-term loudness ratio over the last 3 s: a measure of how punchy the audio is. */
+    float getPsr() const noexcept               { return psr.load(); }
+
+    /** Peak to (integrated) loudness ratio: lower means more compressed overall. */
+    float getPlr() const noexcept
+    {
+        const float peak = truePeakDb.load(), loudness = integrated.load();
+        return peak > -70.0f && loudness > -70.0f ? peak - loudness : 0.0f;
+    }
+
 private:
     struct Biquad
     {
@@ -85,6 +95,9 @@ private:
     int subBlockIndex = 0;
     int subBlocksSeen = 0;
 
+    std::array<float, shortTermBlocks> subBlockPeaks {};
+    float subBlockPeak = 0.0f;
+
     std::array<double, recentBlocks> recentPowers {};
     int recentIndex = 0;
     int recentCount = 0;
@@ -96,6 +109,6 @@ private:
     float truePeakLinear = 0.0f;
 
     std::atomic<float> momentary { silence }, shortTerm { silence }, integrated { silence },
-                       recent { silence }, range { 0.0f }, truePeakDb { silence };
+                       recent { silence }, range { 0.0f }, truePeakDb { silence }, psr { 0.0f };
     std::atomic<bool> resetRequested { false };
 };

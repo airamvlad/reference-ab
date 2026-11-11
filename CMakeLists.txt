@@ -6,7 +6,7 @@ set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "macOS architectures")
 # Windows: link the runtime statically so no Visual C++ redistributable is needed.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-project(ReferenceAB VERSION 0.1.0 LANGUAGES C CXX)
+project(ReferenceAB VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,6 +36,7 @@ juce_add_plugin(ReferenceAB
     COPY_PLUGIN_AFTER_BUILD FALSE)
 
 target_sources(ReferenceAB PRIVATE
+    Source/Analyzer.cpp
     Source/LoudnessMeter.cpp
     Source/ReferenceTrack.cpp
     Source/PluginProcessor.cpp
@@ -81,6 +82,7 @@ add_test(NAME LoudnessTests COMMAND LoudnessTests)
 juce_add_console_app(ProcessorTests PRODUCT_NAME "ProcessorTests")
 target_sources(ProcessorTests PRIVATE
     Tests/ProcessorTests.cpp
+    Source/Analyzer.cpp
     Source/LoudnessMeter.cpp
     Source/ReferenceTrack.cpp
     Source/PluginProcessor.cpp
