@@ -287,8 +287,596 @@ void MeterPanel::paint (juce::Graphics& g)
 }
 
 //==============================================================================
+namespace
+{
+    juce::String signedDb (float value, int decimals = 1)
+    {
+        return (value > 0.0f ? "+" : "") + juce::String (value, decimals);
+    }
+
+    juce::String frequencyLabel (float hz)
+    {
+        if (hz < 1000.0f)
+            return juce::String (juce::roundToInt (hz));
+
+        const int hundreds = juce::roundToInt (hz / 100.0f);
+        return (hundreds % 10 == 0 ? juce::String (hundreds / 10) : juce::String ((float) hundreds / 10.0f, 1)) + "k";
+    }
+}
+
+AnalysisPanel::AnalysisPanel (ReferenceABProcessor& p) : processor (p)
+{
+    const char* names[numTabs] = { "Spectrum", "Balance", "Dynamics" };
+
+    for (int i = 0; i < numTabs; ++i)
+    {
+        auto& button = tabButtons[(size_t) i];
+        button.setButtonText (names[i]);
+        button.setClickingTogglesState (true);
+        button.setRadioGroupId (1001);
+        button.setConnectedEdges ((i > 0 ? juce::Button::ConnectedOnLeft : 0)
+                                | (i < numTabs - 1 ? juce::Button::ConnectedOnRight : 0));
+        button.setColour (juce::TextButton::buttonColourId, Theme::background);
+        button.setColour (juce::TextButton::buttonOnColourId, Theme::outline);
+        button.setColour (juce::TextButton::textColourOffId, Theme::dimText);
+        button.setColour (juce::TextButton::textColourOnId, Theme::text);
+        button.onClick = [this, i] { setTab (i); };
+        addAndMakeVisible (button);
+    }
+
+    mixHistory.fill (LoudnessMeter::silence);
+    refHistory.fill (LoudnessMeter::silence);
+
+    tab = juce::jlimit (0, numTabs - 1, (int) processor.apvts.state.getProperty ("analysisTab", 0));
+    tabButtons[(size_t) tab].setToggleState (true, juce::dontSendNotification);
+}
+
+void AnalysisPanel::setTab (int newTab)
+{
+    tab = newTab;
+    processor.apvts.state.setProperty ("analysisTab", tab, nullptr);
+    repaint();
+}
+
+void AnalysisPanel::resized()
+{
+    auto row = getLocalBounds().reduced (10, 8).removeFromTop (24);
+
+    for (auto& button : tabButtons)
+        button.setBounds (row.removeFromLeft (96));
+}
+
+void AnalysisPanel::clearHistory()
+{
+    mixHistory.fill (LoudnessMeter::silence);
+    refHistory.fill (LoudnessMeter::silence);
+    historyWrite = 0;
+    historyCount = 0;
+}
+
+void AnalysisPanel::tick()
+{
+    if (++tickCounter % 3 == 0)
+    {
+        const auto track = processor.getTrack (processor.getSelectedSlot());
+        const bool hasReference = track != nullptr && track->hasAudio();
+        const float refShortTerm = processor.refMeter.getShortTerm();
+
+        mixHistory[(size_t) historyWrite] = processor.mixMeter.getShortTerm();
+        refHistory[(size_t) historyWrite] = hasReference && refShortTerm > -70.0f
+                                                ? refShortTerm + processor.getAppliedGainDb()
+                                                : LoudnessMeter::silence;
+        historyWrite = (historyWrite + 1) % historySize;
+        historyCount = juce::jmin (historyCount + 1, historySize);
+    }
+
+    repaint();
+}
+
+void AnalysisPanel::paint (juce::Graphics& g)
+{
+    g.setColour (Theme::panel);
+    g.fillRoundedRectangle (getLocalBounds().toFloat(), 6.0f);
+
+    processor.mixAnalyzer.getSnapshot (snapshot);
+    Analyzer::analyse (snapshot, mix);
+
+    const auto track = processor.getTrack (processor.getSelectedSlot());
+
+    if (track != nullptr && track->hasAudio())
+    {
+        processor.refAnalyzer.getSnapshot (snapshot);
+        Analyzer::analyse (snapshot, ref);
+    }
+    else
+    {
+        ref = {};
+    }
+
+    auto area = getLocalBounds().reduced (10, 8);
+    auto top = area.removeFromTop (24);
+    area.removeFromTop (6);
+
+    // Legend, right of the tabs.
+    g.setFont (font (12.0f));
+    auto legend = top.removeFromRight (230);
+    g.setColour (Theme::reference);
+    g.fillRect (legend.removeFromRight (12).withSizeKeepingCentre (12, 3));
+    g.drawText ("Reference", legend.removeFromRight (70), juce::Justification::centredRight);
+    legend.removeFromRight (14);
+    g.setColour (Theme::mix);
+    g.fillRect (legend.removeFromRight (12).withSizeKeepingCentre (12, 3));
+    g.drawText ("Mix", legend.removeFromRight (34), juce::Justification::centredRight);
+
+    if (! mix.valid && ! ref.valid && tab != dynamicsTab)
+    {
+        g.setColour (Theme::dimText);
+        g.setFont (font (14.0f));
+        g.drawText ("Play your project for a few seconds to see the analysis", area, juce::Justification::centred);
+        return;
+    }
+
+    if (tab == spectrumTab)       paintSpectrum (g, area);
+    else if (tab == balanceTab)   paintBalance (g, area);
+    else                          paintDynamics (g, area);
+}
+
+void AnalysisPanel::paintSpectrum (juce::Graphics& g, juce::Rectangle<int> area)
+{
+    const bool both = mix.valid && ref.valid;
+    auto labels = area.removeFromBottom (14);
+    auto difference = both ? area.removeFromBottom (juce::roundToInt ((float) area.getHeight() * 0.32f)) : juce::Rectangle<int>();
+
+    if (both)
+        area.removeFromBottom (6);
+
+    const auto plot = area.toFloat();
+    const float logRange = std::log (1000.0f);
+    auto xFor = [&] (float hz) { return plot.getX() + plot.getWidth() * std::log (hz / 20.0f) / logRange; };
+
+    // Vertical range follows the loudest point of either curve.
+    float peak = -200.0f;
+
+    for (int i = 0; i < Analyzer::Result::numPoints; ++i)
+    {
+        if (mix.valid) peak = juce::jmax (peak, mix.spectrumDb[(size_t) i]);
+        if (ref.valid) peak = juce::jmax (peak, ref.spectrumDb[(size_t) i]);
+    }
+
+    const float topDb = std::ceil ((peak + 3.0f) / 6.0f) * 6.0f;
+    const float bottomDb = topDb - 54.0f;
+    auto yFor = [&] (float db) { return juce::jmap (juce::jlimit (bottomDb, topDb, db), bottomDb, topDb, plot.getBottom(), plot.getY()); };
+
+    g.setFont (font (10.5f));
+
+    for (const float hz : { 20.0f, 50.0f, 100.0f, 200.0f, 500.0f, 1000.0f, 2000.0f, 5000.0f, 10000.0f, 20000.0f })
+    {
+        const float x = xFor (hz);
+        g.setColour (Theme::grid);
+        g.fillRect (x, plot.getY(), 1.0f, plot.getHeight() + (both ? (float) difference.getHeight() + 6.0f : 0.0f));
+        g.setColour (Theme::dimText);
+        g.drawText (frequencyLabel (hz), juce::Rectangle<float> (x - 20.0f, (float) labels.getY(), 40.0f, (float) labels.getHeight()),
+                    hz <= 20.0f ? juce::Justification::centredRight : (hz >= 20000.0f ? juce::Justification::centredLeft : juce::Justification::centred));
+    }
+
+    for (float db = topDb - 6.0f; db > bottomDb; db -= 12.0f)
+    {
+        g.setColour (Theme::grid);
+        g.fillRect (plot.getX(), yFor (db), plot.getWidth(), 1.0f);
+    }
+
+    auto makePath = [&] (const Analyzer::Result& result)
+    {
+        juce::Path path;
+        bool started = false;
+
+        for (int i = 0; i < Analyzer::Result::numPoints; ++i)
+        {
+            const float db = result.spectrumDb[(size_t) i];
+
+            if (db < -150.0f)
+                continue;
+
+            const float x = xFor (Analyzer::Result::pointFrequency (i)), y = yFor (db);
+
+            if (started)  path.lineTo (x, y);
+            else          path.startNewSubPath (x, y);
+
+            started = true;
+        }
+
+        return path;
+    };
+
+    g.saveState();
+    g.reduceClipRegion (area);
+
+    if (ref.valid)
+    {
+        const auto path = makePath (ref);
+        juce::Path fill (path);
+        fill.lineTo (path.getCurrentPosition().x, plot.getBottom());
+        fill.lineTo (path.getBounds().getX(), plot.getBottom());
+        fill.closeSubPath();
+        g.setColour (Theme::reference.withAlpha (0.16f));
+        g.fillPath (fill);
+        g.setColour (Theme::reference);
+        g.strokePath (path, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved));
+    }
+
+    if (mix.valid)
+    {
+        g.setColour (Theme::mix);
+        g.strokePath (makePath (mix), juce::PathStrokeType (1.8f, juce::PathStrokeType::curved));
+    }
+
+    g.restoreState();
+
+    if (! both)
+        return;
+
+    // Difference strip: where the mix has more (above the line) or less than the reference.
+    const auto strip = difference.toFloat();
+    const float range = 12.0f;
+    auto diffY = [&] (float db) { return juce::jmap (juce::jlimit (-range, range, db), -range, range, strip.getBottom(), strip.getY()); };
+
+    g.setColour (Theme::background.withAlpha (0.5f));
+    g.fillRect (strip);
+    g.setColour (Theme::grid);
+    g.fillRect (strip.getX(), diffY (6.0f), strip.getWidth(), 1.0f);
+    g.fillRect (strip.getX(), diffY (-6.0f), strip.getWidth(), 1.0f);
+    g.setColour (Theme::dimText);
+    g.fillRect (strip.getX(), strip.getCentreY(), strip.getWidth(), 1.0f);
+
+    juce::Path line;
+    bool started = false;
+    float firstX = 0.0f, lastX = 0.0f;
+
+    for (int i = 0; i < Analyzer::Result::numPoints; ++i)
+    {
+        const float a = mix.spectrumDb[(size_t) i], b = ref.spectrumDb[(size_t) i];
+
+        // Ignore the region where either signal has no real content (e.g. above an MP3's cutoff).
+        if (a < bottomDb - 12.0f || b < bottomDb - 12.0f)
+            continue;
+
+        const float x = xFor (Analyzer::Result::pointFrequency (i)), y = diffY (a - b);
+
+        if (started)  line.lineTo (x, y);
+        else        { line.startNewSubPath (x, y); firstX = x; }
+
+        started = true;
+        lastX = x;
+    }
+
+    if (started)
+    {
+        juce::Path fill (line);
+        fill.lineTo (lastX, strip.getCentreY());
+        fill.lineTo (firstX, strip.getCentreY());
+        fill.closeSubPath();
+        g.setColour (Theme::text.withAlpha (0.14f));
+        g.fillPath (fill);
+        g.setColour (Theme::text);
+        g.strokePath (line, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved));
+    }
+
+    g.setFont (font (10.5f));
+    g.setColour (Theme::dimText);
+    g.drawText ("Mix minus reference, level-matched  (+/- 12 dB)", difference.reduced (6, 2), juce::Justification::topLeft);
+}
+
+juce::StringArray AnalysisPanel::buildSummary (const ReferenceTrack* track) const
+{
+    juce::StringArray lines;
+
+    if (track == nullptr || ! track->hasAudio())
+        return lines;
+
+    const float mixLoudness = processor.mixMeter.getIntegrated();
+
+    if (mixLoudness > -70.0f && track->integratedLufs > -70.0f)
+    {
+        const float d = mixLoudness - track->integratedLufs;
+        lines.add (std::abs (d) < 0.5f
+                       ? juce::String ("Loudness: the same as the reference")
+                       : "Loudness: mix is " + juce::String (std::abs (d), 1) + " LU " + (d < 0.0f ? "quieter" : "louder")
+                             + " (" + juce::String (mixLoudness, 1) + " vs " + juce::String (track->integratedLufs, 1) + " LUFS)");
+    }
+
+    if (mix.valid && ref.valid)
+    {
+        // The two tonal bands that differ the most.
+        int first = -1, second = -1;
+
+        for (int band = 0; band < Analyzer::Result::numToneBands; ++band)
+        {
+            const float d = std::abs (mix.toneDb[(size_t) band] - ref.toneDb[(size_t) band]);
+
+            if (d < 1.5f)
+                continue;
+
+            if (first < 0 || d > std::abs (mix.toneDb[(size_t) first] - ref.toneDb[(size_t) first]))
+            {
+                second = first;
+                first = band;
+            }
+            else if (second < 0 || d > std::abs (mix.toneDb[(size_t) second] - ref.toneDb[(size_t) second]))
+            {
+                second = band;
+            }
+        }
+
+        auto describe = [this] (int band)
+        {
+            const float d = mix.toneDb[(size_t) band] - ref.toneDb[(size_t) band];
+            return juce::String (Analyzer::toneBandNames()[(size_t) band]) + " is " + juce::String (std::abs (d), 1)
+                       + " dB " + (d > 0.0f ? "stronger" : "weaker");
+        };
+
+        if (first < 0)
+            lines.add ("Tone: close to the reference");
+        else
+            lines.add ("Tone: " + describe (first) + (second >= 0 ? ", " + describe (second) : juce::String()));
+
+        const float sideDifference = mix.sideTotalPercent - ref.sideTotalPercent;
+        lines.add (std::abs (sideDifference) < 4.0f
+                       ? juce::String ("Stereo: width is close to the reference")
+                       : juce::String ("Stereo: mix is ") + (sideDifference < 0.0f ? "narrower" : "wider") + " (side "
+                             + juce::String (juce::roundToInt (mix.sideTotalPercent)) + "% vs "
+                             + juce::String (juce::roundToInt (ref.sideTotalPercent)) + "%)");
+    }
+
+    const float mixPlr = processor.mixMeter.getPlr();
+    const float refPlr = track->truePeakDb > -70.0f && track->integratedLufs > -70.0f ? track->truePeakDb - track->integratedLufs : 0.0f;
+
+    if (mixPlr > 0.0f && refPlr > 0.0f)
+    {
+        const float d = mixPlr - refPlr;
+        lines.add (std::abs (d) < 1.0f
+                       ? juce::String ("Dynamics: similar to the reference")
+                       : juce::String ("Dynamics: mix is ") + (d < 0.0f ? "more compressed" : "more dynamic") + " (PLR "
+                             + juce::String (mixPlr, 1) + " vs " + juce::String (refPlr, 1) + " dB)");
+    }
+
+    return lines;
+}
+
+void AnalysisPanel::paintBalance (juce::Graphics& g, juce::Rectangle<int> area)
+{
+    const auto track = processor.getTrack (processor.getSelectedSlot());
+    const bool both = mix.valid && ref.valid;
+
+    auto summaryArea = area.removeFromRight (juce::roundToInt ((float) area.getWidth() * 0.36f));
+    area.removeFromRight (16);
+    auto toneArea = area.removeFromLeft (juce::roundToInt ((float) area.getWidth() * 0.56f));
+    area.removeFromLeft (16);
+    auto stereoArea = area;
+
+    auto heading = [&] (juce::Rectangle<int>& column, const juce::String& title)
+    {
+        g.setColour (Theme::dimText);
+        g.setFont (font (11.5f));
+        g.drawText (title, column.removeFromTop (18), juce::Justification::centredLeft);
+    };
+
+    // Tonal balance: how much more or less of each band the mix has.
+    heading (toneArea, both ? "TONE: MIX VS REFERENCE (dB)" : "TONE (needs a playing reference)");
+    const int toneRow = toneArea.getHeight() / Analyzer::Result::numToneBands;
+    const auto& edges = Analyzer::toneBandEdges();
+
+    for (int band = 0; band < Analyzer::Result::numToneBands; ++band)
+    {
+        auto row = toneArea.removeFromTop (toneRow).reduced (0, 3);
+        g.setColour (Theme::text);
+        g.setFont (font (12.5f));
+        g.drawText (Analyzer::toneBandNames()[(size_t) band], row.removeFromLeft (62), juce::Justification::centredLeft);
+        g.setColour (Theme::dimText);
+        g.setFont (font (10.5f));
+        g.drawText (frequencyLabel (edges[(size_t) band]) + "-" + frequencyLabel (edges[(size_t) band + 1]),
+                    row.removeFromLeft (52), juce::Justification::centredLeft);
+
+        auto valueArea = row.removeFromRight (46);
+        const auto bar = row.toFloat().reduced (0.0f, 3.0f);
+        g.setColour (Theme::background);
+        g.fillRoundedRectangle (bar, 3.0f);
+        g.setColour (Theme::dimText);
+        g.fillRect (bar.getCentreX() - 0.5f, bar.getY(), 1.0f, bar.getHeight());
+
+        if (both)
+        {
+            const float d = mix.toneDb[(size_t) band] - ref.toneDb[(size_t) band];
+            const float extent = juce::jlimit (-1.0f, 1.0f, d / 9.0f) * bar.getWidth() * 0.5f;
+            const auto colour = std::abs (d) < 1.5f ? Theme::dimText : (std::abs (d) < 3.0f ? Theme::reference : Theme::warning);
+            g.setColour (colour);
+            g.fillRoundedRectangle (juce::Rectangle<float> (juce::jmin (bar.getCentreX(), bar.getCentreX() + extent), bar.getY(),
+                                                            std::abs (extent), bar.getHeight()), 2.0f);
+            g.setColour (Theme::text);
+            g.setFont (font (12.5f, true));
+            g.drawText (signedDb (d), valueArea, juce::Justification::centredRight);
+        }
+    }
+
+    // Stereo: share of the energy that sits in the side channel, per band.
+    heading (stereoArea, "STEREO WIDTH (side %)");
+    const int stereoRow = stereoArea.getHeight() / (Analyzer::Result::numStereoBands + 1);
+
+    for (int band = 0; band <= Analyzer::Result::numStereoBands; ++band)
+    {
+        const bool isCorrelation = band == Analyzer::Result::numStereoBands;
+        auto row = stereoArea.removeFromTop (stereoRow).reduced (0, 3);
+        g.setColour (Theme::text);
+        g.setFont (font (12.5f));
+        g.drawText (isCorrelation ? "Correl." : Analyzer::stereoBandNames()[(size_t) band], row.removeFromLeft (50), juce::Justification::centredLeft);
+
+        auto values = row.removeFromRight (74);
+        auto upper = row.removeFromTop (row.getHeight() / 2).toFloat().reduced (0.0f, 1.5f);
+        auto lower = row.toFloat().reduced (0.0f, 1.5f);
+
+        auto drawBar = [&] (juce::Rectangle<float> bar, const Analyzer::Result& result, juce::Colour colour)
+        {
+            g.setColour (Theme::background);
+            g.fillRoundedRectangle (bar, 2.0f);
+
+            if (! result.valid)
+                return;
+
+            const float amount = isCorrelation ? juce::jlimit (0.0f, 1.0f, 0.5f * (result.correlation + 1.0f))
+                                               : juce::jlimit (0.0f, 1.0f, result.sidePercent[(size_t) band] / 60.0f);
+            g.setColour (colour);
+            g.fillRoundedRectangle (bar.withWidth (juce::jmax (2.0f, amount * bar.getWidth())), 2.0f);
+        };
+
+        drawBar (upper, mix, Theme::mix);
+        drawBar (lower, ref, Theme::reference);
+
+        auto text = [&] (const Analyzer::Result& result)
+        {
+            if (! result.valid)
+                return juce::String ("-");
+
+            return isCorrelation ? juce::String (result.correlation, 2)
+                                 : juce::String (juce::roundToInt (result.sidePercent[(size_t) band])) + "%";
+        };
+
+        g.setFont (font (12.0f, true));
+        g.setColour (Theme::mix);
+        g.drawText (text (mix), values.removeFromLeft (37), juce::Justification::centredRight);
+        g.setColour (Theme::reference);
+        g.drawText (text (ref), values, juce::Justification::centredRight);
+    }
+
+    // Plain-language summary.
+    heading (summaryArea, "SUMMARY");
+    const auto lines = buildSummary (track.get());
+    g.setFont (font (12.5f));
+
+    if (lines.isEmpty())
+    {
+        g.setColour (Theme::dimText);
+        g.drawFittedText ("Load a reference and play both for a few seconds.", summaryArea, juce::Justification::topLeft, 3);
+        return;
+    }
+
+    const int lineHeight = juce::jmin (40, summaryArea.getHeight() / juce::jmax (1, lines.size()));
+
+    for (const auto& line : lines)
+    {
+        const auto row = summaryArea.removeFromTop (lineHeight);
+        const auto label = line.upToFirstOccurrenceOf (":", true, false);
+        g.setColour (Theme::dimText);
+        g.drawText (label, row.withHeight (15), juce::Justification::centredLeft);
+        g.setColour (Theme::text);
+        g.drawFittedText (line.fromFirstOccurrenceOf (": ", false, false), row.withTrimmedTop (15), juce::Justification::topLeft, 2);
+    }
+}
+
+void AnalysisPanel::paintDynamics (juce::Graphics& g, juce::Rectangle<int> area)
+{
+    const auto track = processor.getTrack (processor.getSelectedSlot());
+    const bool hasReference = track != nullptr && track->hasAudio();
+
+    auto numbers = area.removeFromRight (230);
+    area.removeFromRight (16);
+
+    // Short-term loudness over the last minute. The reference is shown as heard (after level matching).
+    g.setColour (Theme::dimText);
+    g.setFont (font (11.5f));
+    g.drawText ("SHORT-TERM LOUDNESS, LAST 60 s (LUFS)", area.removeFromTop (18), juce::Justification::centredLeft);
+
+    auto axis = area.removeFromLeft (28);
+    const auto plot = area.toFloat();
+
+    float topLufs = -6.0f;
+
+    for (int i = 0; i < historySize; ++i)
+        topLufs = juce::jmax (topLufs, mixHistory[(size_t) i], refHistory[(size_t) i]);
+
+    topLufs = std::ceil (topLufs / 6.0f) * 6.0f;
+    const float bottomLufs = topLufs - 36.0f;
+    auto yFor = [&] (float lufs) { return juce::jmap (juce::jlimit (bottomLufs, topLufs, lufs), bottomLufs, topLufs, plot.getBottom(), plot.getY()); };
+
+    g.setColour (Theme::background.withAlpha (0.5f));
+    g.fillRect (plot);
+    g.setFont (font (10.5f));
+
+    for (float lufs = topLufs; lufs >= bottomLufs; lufs -= 6.0f)
+    {
+        const float y = yFor (lufs);
+        g.setColour (Theme::grid);
+        g.fillRect (plot.getX(), y, plot.getWidth(), 1.0f);
+        g.setColour (Theme::dimText);
+        g.drawText (juce::String ((int) lufs), juce::Rectangle<float> ((float) axis.getX(), y - 7.0f, (float) axis.getWidth() - 5.0f, 14.0f),
+                    juce::Justification::centredRight);
+    }
+
+    auto drawHistory = [&] (const std::array<float, historySize>& values, juce::Colour colour)
+    {
+        juce::Path path;
+        bool started = false;
+
+        for (int i = 0; i < historyCount; ++i)
+        {
+            const int index = (historyWrite - historyCount + i + historySize) % historySize;
+            const float value = values[(size_t) index];
+
+            if (value <= -70.0f)
+            {
+                started = false;
+                continue;
+            }
+
+            const float x = plot.getRight() - plot.getWidth() * (float) (historyCount - 1 - i) / (float) (historySize - 1);
+            const float y = yFor (value);
+
+            if (started)  path.lineTo (x, y);
+            else          path.startNewSubPath (x, y);
+
+            started = true;
+        }
+
+        g.setColour (colour);
+        g.strokePath (path, juce::PathStrokeType (1.6f));
+    };
+
+    g.saveState();
+    g.reduceClipRegion (area);
+    drawHistory (refHistory, Theme::reference);
+    drawHistory (mixHistory, Theme::mix);
+    g.restoreState();
+
+    // Numbers.
+    const float mixPsr = processor.mixMeter.getPsr(), mixPlr = processor.mixMeter.getPlr();
+    const float refPsr = hasReference ? processor.refMeter.getPsr() : 0.0f;
+    const float refPlr = hasReference && track->truePeakDb > -70.0f && track->integratedLufs > -70.0f
+                             ? track->truePeakDb - track->integratedLufs : 0.0f;
+
+    auto value = [] (float v) { return v > 0.0f ? juce::String (v, 1) : juce::String ("-"); };
+
+    auto block = [&] (const juce::String& title, const juce::String& hint, float mixValue, float refValue)
+    {
+        auto box = numbers.removeFromTop (numbers.getHeight() > 150 ? 84 : numbers.getHeight());
+        g.setColour (Theme::dimText);
+        g.setFont (font (11.5f));
+        g.drawText (title, box.removeFromTop (18), juce::Justification::centredLeft);
+        auto row = box.removeFromTop (30);
+        g.setFont (font (22.0f, true));
+        g.setColour (Theme::mix);
+        g.drawText (value (mixValue), row.removeFromLeft (row.getWidth() / 2), juce::Justification::centredLeft);
+        g.setColour (Theme::reference);
+        g.drawText (value (refValue), row, juce::Justification::centredLeft);
+        g.setColour (Theme::dimText);
+        g.setFont (font (10.5f));
+        g.drawFittedText (hint, box.removeFromTop (28), juce::Justification::topLeft, 2);
+    };
+
+    block ("PSR: PUNCH RIGHT NOW (dB)", "Peak to short-term loudness. Under about 8 means heavily squashed.", mixPsr, refPsr);
+    block ("PLR: WHOLE SONG (dB)", "True peak to integrated loudness. Lower means more limiting.", mixPlr, refPlr);
+}
+
+//==============================================================================
 ReferenceABEditor::ReferenceABEditor (ReferenceABProcessor& p)
-    : AudioProcessorEditor (&p), processor (p), trackList (p), waveform (p), meters (p)
+    : AudioProcessorEditor (&p), processor (p), trackList (p), waveform (p), meters (p), analysis (p)
 {
     lookAndFeel.setColourScheme (juce::LookAndFeel_V4::getMidnightColourScheme());
     lookAndFeel.setColour (juce::ResizableWindow::backgroundColourId, Theme::background);
@@ -335,7 +923,7 @@ ReferenceABEditor::ReferenceABEditor (ReferenceABProcessor& p)
     bandBox.addItemList ({ "Full", "Low", "Mid", "High" }, 1);
 
     for (auto* component : std::initializer_list<juce::Component*> { &matchButton, &loopButton, &monoButton, &syncBox, &bandBox,
-                                                                     &addButton, &resetButton, &trackList, &waveform, &meters })
+                                                                     &addButton, &resetButton, &trackList, &waveform, &meters, &analysis })
         addAndMakeVisible (*component);
 
     abAttachment    = std::make_unique<APVTS::ButtonAttachment> (processor.apvts, "ab", abButton);
@@ -367,12 +955,12 @@ ReferenceABEditor::ReferenceABEditor (ReferenceABProcessor& p)
 
     resetButton.onClick = [this]
     {
-        processor.mixMeter.requestReset();
-        processor.refMeter.requestReset();
+        processor.resetMeasurements();
+        analysis.clearHistory();
     };
 
     processor.addChangeListener (this);
-    setSize (940, 580);
+    setSize (960, 720);
     startTimerHz (30);
 }
 
@@ -438,7 +1026,9 @@ void ReferenceABEditor::resized()
     hintLabel.setBounds (bottom);
     area.removeFromBottom (8);
 
-    meters.setBounds (area.removeFromBottom (120));
+    meters.setBounds (area.removeFromBottom (100));
+    area.removeFromBottom (10);
+    analysis.setBounds (area.removeFromBottom (256));
     area.removeFromBottom (10);
 
     auto controls = area.removeFromBottom (30);
@@ -462,6 +1052,7 @@ void ReferenceABEditor::timerCallback()
                        juce::dontSendNotification);
     waveform.repaint();
     meters.repaint();
+    analysis.tick();
     trackList.repaint();
 }
 

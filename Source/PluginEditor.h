@@ -12,6 +12,7 @@ namespace Theme
     const juce::Colour mix        { 0xff4aa3ff };
     const juce::Colour reference  { 0xffffa23a };
     const juce::Colour warning    { 0xffff5d5d };
+    const juce::Colour grid       { 0xff2a303a };
 }
 
 //==============================================================================
@@ -68,6 +69,44 @@ private:
 };
 
 //==============================================================================
+/** Tabbed analysis views: spectrum, tonal/stereo balance and dynamics. */
+class AnalysisPanel : public juce::Component
+{
+public:
+    explicit AnalysisPanel (ReferenceABProcessor&);
+
+    void paint (juce::Graphics&) override;
+    void resized() override;
+
+    /** Called 30 times a second by the editor. */
+    void tick();
+    void clearHistory();
+
+private:
+    enum Tab { spectrumTab = 0, balanceTab, dynamicsTab, numTabs };
+
+    void setTab (int newTab);
+    void paintSpectrum (juce::Graphics&, juce::Rectangle<int>);
+    void paintBalance (juce::Graphics&, juce::Rectangle<int>);
+    void paintDynamics (juce::Graphics&, juce::Rectangle<int>);
+    juce::StringArray buildSummary (const ReferenceTrack* track) const;
+
+    static constexpr int historySize = 600;     // 60 s at 10 Hz
+
+    ReferenceABProcessor& processor;
+    std::array<juce::TextButton, numTabs> tabButtons;
+    int tab = spectrumTab;
+
+    Analyzer::Snapshot snapshot;
+    Analyzer::Result mix, ref;
+
+    std::array<float, historySize> mixHistory {}, refHistory {};
+    int historyWrite = 0;
+    int historyCount = 0;
+    int tickCounter = 0;
+};
+
+//==============================================================================
 class ReferenceABEditor : public juce::AudioProcessorEditor,
                           public juce::FileDragAndDropTarget,
                           private juce::ChangeListener,
@@ -107,6 +146,7 @@ private:
     TrackList trackList;
     WaveformView waveform;
     MeterPanel meters;
+    AnalysisPanel analysis;
 
     std::unique_ptr<APVTS::ButtonAttachment> abAttachment, matchAttachment, loopAttachment, monoAttachment;
     std::unique_ptr<APVTS::SliderAttachment> trimAttachment;

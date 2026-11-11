@@ -87,6 +87,9 @@ void LoudnessMeter::reset()
     subBlockFill = 0;
     subBlockSum = 0.0;
     subBlocks.fill (0.0);
+    subBlockPeaks.fill (0.0f);
+    subBlockPeak = 0.0f;
+    psr.store (0.0f);
     subBlockIndex = 0;
     subBlocksSeen = 0;
     recentPowers.fill (0.0);
@@ -139,6 +142,9 @@ void LoudnessMeter::process (const juce::AudioBuffer<float>& buffer, int numSamp
 
             subBlockSum += sum;
         }
+
+        for (int ch = 0; ch < numCh; ++ch)
+            subBlockPeak = juce::jmax (subBlockPeak, buffer.getMagnitude (ch, position, todo));
 
         subBlockFill += todo;
         position += todo;
@@ -195,6 +201,8 @@ void LoudnessMeter::finishSubBlock()
     subBlockFill = 0;
 
     subBlocks[(size_t) subBlockIndex] = power;
+    subBlockPeaks[(size_t) subBlockIndex] = subBlockPeak;
+    subBlockPeak = 0.0f;
     subBlockIndex = (subBlockIndex + 1) % shortTermBlocks;
     subBlocksSeen = juce::jmin (subBlocksSeen + 1, shortTermBlocks);
 
@@ -230,6 +238,13 @@ void LoudnessMeter::finishSubBlock()
     {
         const float s = powerToLufs (meanOfLast (shortTermBlocks));
         shortTerm.store (s);
+
+        float peak = 0.0f;
+
+        for (const float p : subBlockPeaks)
+            peak = juce::jmax (peak, p);
+
+        psr.store (s > (float) absoluteGate && peak > 0.0f ? juce::Decibels::gainToDecibels (peak) - s : 0.0f);
 
         if (s >= (float) absoluteGate)
             ++shortTermHistogram[(size_t) binFor (s)];
