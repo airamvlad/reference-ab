@@ -24,10 +24,13 @@ public:
     static constexpr int fftSize = 1 << fftOrder;
     static constexpr int numBins = fftSize / 2 + 1;
     static constexpr int hopSize = fftSize / 2;
+    static constexpr int scopePoints = 1024;
 
     struct Snapshot
     {
         std::array<float, numBins> left {}, right {}, cross {};
+        std::array<float, numBins> fast {};                 // quick-moving total power
+        std::array<float, scopePoints> scopeLeft {}, scopeRight {};   // most recent samples
         double sampleRate = 48000.0;
         bool valid = false;
     };
@@ -41,6 +44,7 @@ public:
 
         bool valid = false;
         std::array<float, numPoints> spectrumDb {};  // relative to total level, pink noise reads flat
+        std::array<float, numPoints> fastDb {};      // the same for the quick-moving spectrum
         std::array<float, numToneBands> toneDb {};   // band level relative to total level
         std::array<float, numStereoBands> sidePercent {};
         float sideTotalPercent = 0.0f;
@@ -79,7 +83,8 @@ private:
     std::array<float, fftSize * 2> workLeft {}, workRight {};
     int fifoFill = 0;
 
-    std::array<float, numBins> left {}, right {}, cross {};
+    std::array<float, numBins> left {}, right {}, cross {}, fast {};
+    float fastAlpha = 0.2f;
     int frames = 0;
     int framesForAverage = 100;
     double sampleRate = 48000.0;

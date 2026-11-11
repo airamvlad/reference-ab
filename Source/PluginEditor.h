@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PluginProcessor.h"
+#include "ReferenceLibrary.h"
 
 namespace Theme
 {
@@ -83,12 +84,15 @@ public:
     void clearHistory();
 
 private:
-    enum Tab { spectrumTab = 0, balanceTab, dynamicsTab, numTabs };
+    enum Tab { spectrumTab = 0, balanceTab, stereoTab, dynamicsTab, numTabs };
 
     void setTab (int newTab);
     void paintSpectrum (juce::Graphics&, juce::Rectangle<int>);
     void paintBalance (juce::Graphics&, juce::Rectangle<int>);
     void paintDynamics (juce::Graphics&, juce::Rectangle<int>);
+    void paintStereo (juce::Graphics&, juce::Rectangle<int>);
+    void paintGoniometer (juce::Graphics&, juce::Rectangle<int>, const Analyzer::Snapshot&, const Analyzer::Result&,
+                          float& scale, juce::Colour, const juce::String& title);
     juce::StringArray buildSummary (const ReferenceTrack* track) const;
 
     static constexpr int historySize = 600;     // 60 s at 10 Hz
@@ -97,8 +101,9 @@ private:
     std::array<juce::TextButton, numTabs> tabButtons;
     int tab = spectrumTab;
 
-    Analyzer::Snapshot snapshot;
+    Analyzer::Snapshot mixSnapshot, refSnapshot;
     Analyzer::Result mix, ref;
+    float mixScopeScale = 0.0f, refScopeScale = 0.0f;
 
     std::array<float, historySize> mixHistory {}, refHistory {};
     int historyWrite = 0;
@@ -119,6 +124,7 @@ public:
     void paint (juce::Graphics&) override;
     void paintOverChildren (juce::Graphics&) override;
     void resized() override;
+    bool keyPressed (const juce::KeyPress&) override;
 
     bool isInterestedInFileDrag (const juce::StringArray& files) override;
     void fileDragEnter (const juce::StringArray&, int, int) override    { dropHighlight = true; repaint(); }
@@ -130,6 +136,9 @@ private:
     void timerCallback() override;
     void addFiles (const juce::StringArray& paths, int preferredSlot);
     void updateABButton();
+    void showLibraryMenu();
+    void setParameter (const juce::String& id, float plainValue);
+    void toggleParameter (const juce::String& id);
 
     using APVTS = juce::AudioProcessorValueTreeState;
 
@@ -141,7 +150,7 @@ private:
     juce::Slider trimSlider;
     juce::Label trimLabel, gainLabel, syncLabel, bandLabel, hintLabel;
     juce::ComboBox syncBox, bandBox;
-    juce::TextButton addButton { "Add files..." }, resetButton { "Reset meters" };
+    juce::TextButton addButton { "Add files..." }, libraryButton { "Library" }, resetButton { "Reset meters" };
 
     TrackList trackList;
     WaveformView waveform;
@@ -154,6 +163,7 @@ private:
     std::unique_ptr<juce::FileChooser> chooser;
 
     bool dropHighlight = false;
+    bool constructed = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ReferenceABEditor)
 };

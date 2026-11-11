@@ -1,20 +1,27 @@
 Reference AB - instalacija
 ==========================
 
-WINDOWS
+WINDOWS (instaler)
 1. Zatvori Bitwig.
-2. Kopiraj ceo folder "Reference AB.vst3" u:
-      C:\Program Files\Common Files\VST3
+2. Pokreni "ReferenceAB-x.y.z-Windows-Setup.exe".
+   Windows moze da prikaze plavi prozor "Windows protected your PC", jer
+   instaler nije potpisan. Klikni "More info", pa "Run anyway".
 3. Otvori Bitwig. Plugin se zove "Reference AB".
 
-MAC
+MAC (instaler)
 1. Zatvori Bitwig.
-2. Raspakuj "Reference AB.vst3.zip" i kopiraj "Reference AB.vst3" u:
-      ~/Library/Audio/Plug-Ins/VST3
-   (u Finderu: Go > Go to Folder... i nalepi putanju)
-3. Plugin nije potpisan Apple sertifikatom, pa jednom pokreni ovo u Terminalu:
-      xattr -cr ~/Library/Audio/Plug-Ins/VST3/"Reference AB.vst3"
-4. Otvori Bitwig. Plugin se zove "Reference AB".
+2. Desni klik na "ReferenceAB-x.y.z-macOS.pkg", pa "Open".
+   Ako macOS ne dozvoli: System Settings > Privacy & Security, pa dole
+   klikni "Open Anyway". To je zato sto instaler nije potpisan Apple
+   sertifikatom.
+3. Otvori Bitwig. Plugin se zove "Reference AB".
+
+RUCNA INSTALACIJA (ako instaler ne radi)
+Windows: raspakuj "...-Windows-manual.zip" i kopiraj folder
+   "Reference AB.vst3" u  C:\Program Files\Common Files\VST3
+Mac: raspakuj "...-macOS-manual.zip", kopiraj "Reference AB.vst3" u
+   ~/Library/Audio/Plug-Ins/VST3  i jednom pokreni u Terminalu:
+   xattr -cr ~/Library/Audio/Plug-Ins/VST3/"Reference AB.vst3"
 
 Ako se plugin ne pojavi: Bitwig > Settings > Locations > Plug-in Locations,
 proveri da je VST3 folder na listi i klikni Rescan.

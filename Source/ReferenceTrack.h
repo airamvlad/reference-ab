@@ -32,6 +32,9 @@ public:
 
     bool hasLoopRegion() const noexcept     { return loopEnd.load() > loopStart.load(); }
 
+    /** Integrated loudness of a section given as fractions of the length. Slow: never call on the audio thread. */
+    float measureLoudness (double start, double end) const;
+
     juce::File file;
     juce::String name;
     juce::String error;
@@ -47,4 +50,7 @@ public:
 
     // Loop region as a fraction of the track length. Equal values mean "no region".
     std::atomic<double> loopStart { 0.0 }, loopEnd { 0.0 };
+
+    // Loudness of the loop region, or -100 while unknown. Used for level matching.
+    std::atomic<float> regionLufs { -100.0f };
 };

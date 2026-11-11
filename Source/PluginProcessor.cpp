@@ -122,6 +122,7 @@ bool ReferenceABProcessor::renderReference (int slot, int numSamples, bool playi
     }
 
     activeRefLufs = track->integratedLufs;
+    bool regionActive = false;
 
     if (! playing)
         return false;
@@ -142,9 +143,15 @@ bool ReferenceABProcessor::renderReference (int slot, int numSamples, bool playi
             {
                 regionStart = s;
                 regionEnd = e;
+                regionActive = true;
             }
         }
     }
+
+    // With a loop region, match levels to that section rather than to the whole song.
+    if (regionActive)
+        if (const float regionLufs = track->regionLufs.load(); regionLufs > -70.0f)
+            activeRefLufs = regionLufs;
 
     juce::int64 position = positions[(size_t) slot].load();
 
@@ -409,7 +416,34 @@ void ReferenceABProcessor::loadFile (int slot, const juce::File& file, double lo
             loaded->loopEnd.store (current->loopEnd.load());
         }
 
+        if (loaded->hasAudio() && loaded->hasLoopRegion())
+            loaded->regionLufs.store (loaded->measureLoudness (loaded->loopStart.load(), loaded->loopEnd.load()));
+
         installTrack (slot, loaded);
+    });
+}
+
+void ReferenceABProcessor::setLoopRegion (int slot, double start, double end)
+{
+    auto track = getTrack (slot);
+
+    if (track == nullptr)
+        return;
+
+    track->loopStart.store (start);
+    track->loopEnd.store (end);
+    track->regionLufs.store (LoudnessMeter::silence);
+
+    if (! track->hasAudio() || end <= start)
+        return;
+
+    // Measured in the background; the result is dropped if the region moved again meanwhile.
+    loader.addJob ([track, start, end]
+    {
+        const float loudness = track->measureLoudness (start, end);
+
+        if (juce::approximatelyEqual (track->loopStart.load(), start) && juce::approximatelyEqual (track->loopEnd.load(), end))
+            track->regionLufs.store (loudness);
     });
 }
 
@@ -514,8 +548,7 @@ void ReferenceABProcessor::setStateInformation (const void* data, int sizeInByte
 
             if (existing != nullptr && existing->file == juce::File (path) && existing->error.isEmpty())
             {
-                existing->loopStart.store (loopStart);
-                existing->loopEnd.store (loopEnd);
+                setLoopRegion (slot, loopStart, loopEnd);
             }
             else
             {

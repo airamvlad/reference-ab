@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -26,6 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^project(ReferenceAB VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          test -n "$version"
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
@@ -40,22 +48,67 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item -Recurse "build/ReferenceAB_artefacts/Release/VST3/Reference AB.vst3" dist/
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DAppVersion=$env:APP_VERSION" installer\windows.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Manual install fallback: the plain plugin folder as a zip.
+          Compress-Archive -Path "build/ReferenceAB_artefacts/Release/VST3/Reference AB.vst3" `
+                           -DestinationPath "dist/ReferenceAB-$env:APP_VERSION-Windows-manual.zip"
           Copy-Item docs/INSTALL.txt dist/
+          Get-ChildItem dist
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
-          mkdir -p dist
-          cp -R "build/ReferenceAB_artefacts/Release/VST3/Reference AB.vst3" dist/
-          codesign --force --deep --sign - "dist/Reference AB.vst3"
-          lipo -archs "dist/Reference AB.vst3/Contents/MacOS/Reference AB"
+          set -euo pipefail
+          plugin="build/ReferenceAB_artefacts/Release/VST3/Reference AB.vst3"
+          mkdir -p dist pkgroot/Library/Audio/Plug-Ins/VST3
+          cp -R "$plugin" pkgroot/Library/Audio/Plug-Ins/VST3/
+          codesign --force --deep --sign - "pkgroot/Library/Audio/Plug-Ins/VST3/Reference AB.vst3"
+          lipo -archs "pkgroot/Library/Audio/Plug-Ins/VST3/Reference AB.vst3/Contents/MacOS/Reference AB"
+
+          # Always install to the system VST3 folder, even if a copy exists elsewhere.
+          pkgbuild --analyze --root pkgroot component.plist
+          /usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" component.plist || true
+          pkgbuild --root pkgroot --component-plist component.plist \
+                   --identifier com.referenceab.plugin.pkg --version "$APP_VERSION" \
+                   --install-location / "dist/ReferenceAB-$APP_VERSION-macOS.pkg"
+
+          # Manual install fallback.
+          ditto -c -k --keepParent "pkgroot/Library/Audio/Plug-Ins/VST3/Reference AB.vst3" \
+                "dist/ReferenceAB-$APP_VERSION-macOS-manual.zip"
           cp docs/INSTALL.txt dist/
-          # Keep the bundle intact inside the artifact (permissions, signature).
-          cd dist && ditto -c -k --keepParent "Reference AB.vst3" "Reference AB.vst3.zip" && rm -rf "Reference AB.vst3"
+          ls -la dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: ReferenceAB-${{ matrix.name }}
           path: dist/
           if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir files
+          cp artifacts/ReferenceAB-Windows/*.exe artifacts/ReferenceAB-Windows/*.zip files/
+          cp artifacts/ReferenceAB-macOS/*.pkg artifacts/ReferenceAB-macOS/*.zip files/
+          cp artifacts/ReferenceAB-macOS/INSTALL.txt files/
+          gh release create "$GITHUB_REF_NAME" files/* \
+            --repo "$GITHUB_REPOSITORY" --title "Reference AB $GITHUB_REF_NAME" --generate-notes

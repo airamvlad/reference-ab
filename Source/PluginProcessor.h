@@ -55,6 +55,9 @@ public:
     int addFile (const juce::File& file);
 
     void removeTrack (int slot);
+
+    /** Sets (or with equal values clears) the loop region of a slot and re-measures its loudness. */
+    void setLoopRegion (int slot, double start, double end);
     ReferenceTrack::Ptr getTrack (int slot) const;
 
     int getSelectedSlot() const;

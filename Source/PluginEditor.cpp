@@ -211,6 +211,7 @@ void WaveformView::mouseDrag (const juce::MouseEvent& event)
         const double current = xToPosition (event.x);
         track->loopStart.store (juce::jmin (dragAnchor, current));
         track->loopEnd.store (juce::jmax (dragAnchor, current));
+        track->regionLufs.store (LoudnessMeter::silence);
         repaint();
     }
 }
@@ -219,9 +220,12 @@ void WaveformView::mouseUp (const juce::MouseEvent& event)
 {
     if (dragging)
     {
-        // Start listening from the beginning of the new region.
+        // Measure the new region for level matching and start listening from its beginning.
         if (auto track = processor.getTrack (processor.getSelectedSlot()))
+        {
+            processor.setLoopRegion (processor.getSelectedSlot(), track->loopStart.load(), track->loopEnd.load());
             processor.seek (track->loopStart.load());
+        }
     }
     else if (! event.mouseWasDraggedSinceMouseDown() && event.getNumberOfClicks() < 2)
     {
@@ -233,12 +237,8 @@ void WaveformView::mouseUp (const juce::MouseEvent& event)
 
 void WaveformView::mouseDoubleClick (const juce::MouseEvent&)
 {
-    if (auto track = processor.getTrack (processor.getSelectedSlot()))
-    {
-        track->loopStart.store (0.0);
-        track->loopEnd.store (0.0);
-        repaint();
-    }
+    processor.setLoopRegion (processor.getSelectedSlot(), 0.0, 0.0);
+    repaint();
 }
 
 //==============================================================================
@@ -268,22 +268,60 @@ void MeterPanel::paint (juce::Graphics& g)
 
     auto area = getLocalBounds().reduced (12, 8);
     const int rowHeight = area.getHeight() / 3;
-    const int firstColumn = 110;
-    const int columnWidth = (area.getWidth() - firstColumn) / (headers.size() - 1);
+    const int firstColumn = 104;
+    const int barColumn = juce::jlimit (120, 320, area.getWidth() / 4);
+    const int columnWidth = (area.getWidth() - firstColumn - barColumn) / (headers.size() - 1);
 
-    auto drawRow = [&] (const juce::StringArray& cells, juce::Rectangle<int> row, juce::Colour colour, float size, bool bold)
+    // Level bar: momentary loudness as the fill, short-term as the white tick. -42 .. 0 LUFS.
+    auto drawBar = [&] (juce::Rectangle<int> cell, float momentaryLufs, float shortTermLufs, juce::Colour colour)
+    {
+        const auto bar = cell.toFloat().reduced (0.0f, (float) cell.getHeight() * 0.28f).withTrimmedRight (14.0f);
+        auto amount = [] (float lufs) { return juce::jlimit (0.0f, 1.0f, (lufs + 42.0f) / 42.0f); };
+        g.setColour (Theme::background);
+        g.fillRoundedRectangle (bar, 3.0f);
+
+        for (const float lufs : { -36.0f, -30.0f, -24.0f, -18.0f, -12.0f, -6.0f })
+        {
+            g.setColour (Theme::grid);
+            g.fillRect (bar.getX() + bar.getWidth() * amount (lufs), bar.getY(), 1.0f, bar.getHeight());
+        }
+
+        if (momentaryLufs > -70.0f)
+        {
+            g.setColour (colour);
+            g.fillRoundedRectangle (bar.withWidth (juce::jmax (3.0f, bar.getWidth() * amount (momentaryLufs))), 3.0f);
+        }
+
+        if (shortTermLufs > -70.0f)
+        {
+            g.setColour (Theme::text);
+            g.fillRect (bar.getX() + bar.getWidth() * amount (shortTermLufs) - 1.0f, bar.getY() - 2.0f, 2.0f, bar.getHeight() + 4.0f);
+        }
+    };
+
+    auto drawRow = [&] (const juce::StringArray& cells, juce::Rectangle<int> row, juce::Colour colour, float size, bool bold,
+                        const LoudnessMeter* meter)
     {
         g.setColour (colour);
         g.setFont (font (size, bold));
         g.drawText (cells[0], row.removeFromLeft (firstColumn), juce::Justification::centredLeft);
+        const auto barCell = row.removeFromLeft (barColumn);
+
+        if (meter != nullptr)
+            drawBar (barCell, meter->getMomentary(), meter->getShortTerm(), colour);
+        else if (cells[0].isEmpty())
+            g.drawText ("-42 LUFS . . . 0", barCell.withTrimmedRight (14), juce::Justification::centred);
+
+        g.setColour (colour);
+        g.setFont (font (size, bold));
 
         for (int i = 1; i < cells.size(); ++i)
             g.drawText (cells[i], row.removeFromLeft (columnWidth), juce::Justification::centred);
     };
 
-    drawRow (headers, area.removeFromTop (rowHeight), Theme::dimText, 12.0f, false);
-    drawRow (mixRow, area.removeFromTop (rowHeight), Theme::mix, 17.0f, true);
-    drawRow (refRow, area.removeFromTop (rowHeight), Theme::reference, 17.0f, true);
+    drawRow (headers, area.removeFromTop (rowHeight), Theme::dimText, 12.0f, false, nullptr);
+    drawRow (mixRow, area.removeFromTop (rowHeight), Theme::mix, 17.0f, true, &mix);
+    drawRow (refRow, area.removeFromTop (rowHeight), Theme::reference, 17.0f, true, hasReference ? &ref : nullptr);
 }
 
 //==============================================================================
@@ -306,7 +344,7 @@ namespace
 
 AnalysisPanel::AnalysisPanel (ReferenceABProcessor& p) : processor (p)
 {
-    const char* names[numTabs] = { "Spectrum", "Balance", "Dynamics" };
+    const char* names[numTabs] = { "Spectrum", "Balance", "Stereo", "Dynamics" };
 
     for (int i = 0; i < numTabs; ++i)
     {
@@ -378,18 +416,19 @@ void AnalysisPanel::paint (juce::Graphics& g)
     g.setColour (Theme::panel);
     g.fillRoundedRectangle (getLocalBounds().toFloat(), 6.0f);
 
-    processor.mixAnalyzer.getSnapshot (snapshot);
-    Analyzer::analyse (snapshot, mix);
+    processor.mixAnalyzer.getSnapshot (mixSnapshot);
+    Analyzer::analyse (mixSnapshot, mix);
 
     const auto track = processor.getTrack (processor.getSelectedSlot());
 
     if (track != nullptr && track->hasAudio())
     {
-        processor.refAnalyzer.getSnapshot (snapshot);
-        Analyzer::analyse (snapshot, ref);
+        processor.refAnalyzer.getSnapshot (refSnapshot);
+        Analyzer::analyse (refSnapshot, ref);
     }
     else
     {
+        refSnapshot.valid = false;
         ref = {};
     }
 
@@ -418,6 +457,7 @@ void AnalysisPanel::paint (juce::Graphics& g)
 
     if (tab == spectrumTab)       paintSpectrum (g, area);
     else if (tab == balanceTab)   paintBalance (g, area);
+    else if (tab == stereoTab)    paintStereo (g, area);
     else                          paintDynamics (g, area);
 }
 
@@ -465,14 +505,14 @@ void AnalysisPanel::paintSpectrum (juce::Graphics& g, juce::Rectangle<int> area)
         g.fillRect (plot.getX(), yFor (db), plot.getWidth(), 1.0f);
     }
 
-    auto makePath = [&] (const Analyzer::Result& result)
+    auto makePath = [&] (const std::array<float, Analyzer::Result::numPoints>& values)
     {
         juce::Path path;
         bool started = false;
 
         for (int i = 0; i < Analyzer::Result::numPoints; ++i)
         {
-            const float db = result.spectrumDb[(size_t) i];
+            const float db = values[(size_t) i];
 
             if (db < -150.0f)
                 continue;
@@ -491,9 +531,22 @@ void AnalysisPanel::paintSpectrum (juce::Graphics& g, juce::Rectangle<int> area)
     g.saveState();
     g.reduceClipRegion (area);
 
+    // Thin lines: the spectrum right now. Thick lines: the average of the last seconds.
     if (ref.valid)
     {
-        const auto path = makePath (ref);
+        g.setColour (Theme::reference.withAlpha (0.4f));
+        g.strokePath (makePath (ref.fastDb), juce::PathStrokeType (1.0f));
+    }
+
+    if (mix.valid)
+    {
+        g.setColour (Theme::mix.withAlpha (0.45f));
+        g.strokePath (makePath (mix.fastDb), juce::PathStrokeType (1.0f));
+    }
+
+    if (ref.valid)
+    {
+        const auto path = makePath (ref.spectrumDb);
         juce::Path fill (path);
         fill.lineTo (path.getCurrentPosition().x, plot.getBottom());
         fill.lineTo (path.getBounds().getX(), plot.getBottom());
@@ -507,7 +560,7 @@ void AnalysisPanel::paintSpectrum (juce::Graphics& g, juce::Rectangle<int> area)
     if (mix.valid)
     {
         g.setColour (Theme::mix);
-        g.strokePath (makePath (mix), juce::PathStrokeType (1.8f, juce::PathStrokeType::curved));
+        g.strokePath (makePath (mix.spectrumDb), juce::PathStrokeType (1.8f, juce::PathStrokeType::curved));
     }
 
     g.restoreState();
@@ -771,6 +824,105 @@ void AnalysisPanel::paintBalance (juce::Graphics& g, juce::Rectangle<int> area)
     }
 }
 
+void AnalysisPanel::paintGoniometer (juce::Graphics& g, juce::Rectangle<int> area, const Analyzer::Snapshot& data,
+                                     const Analyzer::Result& result, float& scale, juce::Colour colour, const juce::String& title)
+{
+    g.setColour (Theme::dimText);
+    g.setFont (font (11.5f));
+    g.drawText (title, area.removeFromTop (18), juce::Justification::centredLeft);
+
+    // Correlation bar under the scope: -1 (out of phase) .. +1 (mono).
+    auto correlationRow = area.removeFromBottom (20);
+    area.removeFromBottom (6);
+
+    const float size = (float) juce::jmin (area.getWidth(), area.getHeight());
+    const auto square = juce::Rectangle<float> (size, size).withCentre (area.toFloat().getCentre());
+    const auto centre = square.getCentre();
+    const float radius = size * 0.5f;
+
+    g.setColour (Theme::background.withAlpha (0.6f));
+    g.fillEllipse (square);
+    g.setColour (Theme::grid);
+    g.drawEllipse (square.reduced (0.5f), 1.0f);
+    g.drawLine (centre.x, square.getY(), centre.x, square.getBottom(), 1.0f);
+    g.drawLine (square.getX(), centre.y, square.getRight(), centre.y, 1.0f);
+    const float d = radius * 0.7071f;
+    g.drawLine (centre.x - d, centre.y - d, centre.x + d, centre.y + d, 1.0f);
+    g.drawLine (centre.x - d, centre.y + d, centre.x + d, centre.y - d, 1.0f);
+
+    g.setColour (Theme::dimText);
+    g.setFont (font (10.5f));
+    g.drawText ("L", juce::Rectangle<float> (centre.x - d - 16.0f, centre.y - d - 14.0f, 14.0f, 14.0f), juce::Justification::centred);
+    g.drawText ("R", juce::Rectangle<float> (centre.x + d + 2.0f, centre.y - d - 14.0f, 14.0f, 14.0f), juce::Justification::centred);
+
+    if (data.valid)
+    {
+        float peak = 1.0e-4f;
+
+        for (int i = 0; i < Analyzer::scopePoints; ++i)
+            peak = juce::jmax (peak, std::abs (data.scopeLeft[(size_t) i]), std::abs (data.scopeRight[(size_t) i]));
+
+        // Zoom follows the level slowly, so quiet material is still visible.
+        scale = juce::jmax (peak, scale * 0.97f);
+        const float gain = radius * 0.95f / (scale * 1.4142f);
+
+        g.saveState();
+        juce::Path clip;
+        clip.addEllipse (square);
+        g.reduceClipRegion (clip);
+        g.setColour (colour.withAlpha (0.55f));
+
+        for (int i = 0; i < Analyzer::scopePoints; ++i)
+        {
+            const float l = data.scopeLeft[(size_t) i], r = data.scopeRight[(size_t) i];
+            g.fillRect (centre.x + (r - l) * gain - 0.75f, centre.y - (l + r) * gain - 0.75f, 1.5f, 1.5f);
+        }
+
+        g.restoreState();
+    }
+
+    g.setColour (Theme::dimText);
+    g.setFont (font (10.5f));
+    g.drawText ("-1", correlationRow.removeFromLeft (18), juce::Justification::centredLeft);
+    auto valueText = correlationRow.removeFromRight (42);
+    g.drawText ("+1", correlationRow.removeFromRight (20), juce::Justification::centredRight);
+    const auto bar = correlationRow.toFloat().reduced (2.0f, 6.0f);
+    g.setColour (Theme::background);
+    g.fillRoundedRectangle (bar, 3.0f);
+    g.setColour (Theme::dimText);
+    g.fillRect (bar.getCentreX() - 0.5f, bar.getY() - 2.0f, 1.0f, bar.getHeight() + 4.0f);
+
+    if (result.valid)
+    {
+        const float x = bar.getX() + bar.getWidth() * 0.5f * (result.correlation + 1.0f);
+        g.setColour (result.correlation < 0.0f ? Theme::warning : colour);
+        g.fillRoundedRectangle (x - 3.0f, bar.getY() - 3.0f, 6.0f, bar.getHeight() + 6.0f, 2.0f);
+        g.setFont (font (12.0f, true));
+        g.drawText (juce::String (result.correlation, 2), valueText, juce::Justification::centredRight);
+    }
+}
+
+void AnalysisPanel::paintStereo (juce::Graphics& g, juce::Rectangle<int> area)
+{
+    auto notes = area.removeFromRight (juce::roundToInt ((float) area.getWidth() * 0.28f));
+    area.removeFromRight (16);
+    auto left = area.removeFromLeft (area.getWidth() / 2 - 8);
+    area.removeFromLeft (16);
+
+    paintGoniometer (g, left, mixSnapshot, mix, mixScopeScale, Theme::mix, "MIX");
+    paintGoniometer (g, area, refSnapshot, ref, refScopeScale, Theme::reference, "REFERENCE");
+
+    g.setColour (Theme::dimText);
+    g.setFont (font (11.5f));
+    g.drawText ("HOW TO READ IT", notes.removeFromTop (18), juce::Justification::centredLeft);
+    g.setFont (font (12.0f));
+    g.setColour (Theme::text.withAlpha (0.85f));
+    g.drawFittedText ("A thin vertical line is mono. The wider the cloud, the wider the stereo image.\n\n"
+                      "A cloud that leans sideways more than upwards, or a marker left of the centre, "
+                      "means phase problems that will thin out the sound in mono.",
+                      notes, juce::Justification::topLeft, 12);
+}
+
 void AnalysisPanel::paintDynamics (juce::Graphics& g, juce::Rectangle<int> area)
 {
     const auto track = processor.getTrack (processor.getSelectedSlot());
@@ -916,14 +1068,14 @@ ReferenceABEditor::ReferenceABEditor (ReferenceABProcessor& p)
     }
 
     gainLabel.setJustificationType (juce::Justification::centredRight);
-    hintLabel.setText ("Bypass or remove the plugin before exporting your song.", juce::dontSendNotification);
+    hintLabel.setText ("Keys: A / B switch, 1-8 song, L loop, M mono      Bypass the plugin before exporting.", juce::dontSendNotification);
     hintLabel.setJustificationType (juce::Justification::centredRight);
 
     syncBox.addItemList ({ "Free", "Transport", "Timeline" }, 1);
     bandBox.addItemList ({ "Full", "Low", "Mid", "High" }, 1);
 
     for (auto* component : std::initializer_list<juce::Component*> { &matchButton, &loopButton, &monoButton, &syncBox, &bandBox,
-                                                                     &addButton, &resetButton, &trackList, &waveform, &meters, &analysis })
+                                                                     &addButton, &libraryButton, &resetButton, &trackList, &waveform, &meters, &analysis })
         addAndMakeVisible (*component);
 
     abAttachment    = std::make_unique<APVTS::ButtonAttachment> (processor.apvts, "ab", abButton);
@@ -953,6 +1105,8 @@ ReferenceABEditor::ReferenceABEditor (ReferenceABProcessor& p)
         });
     };
 
+    libraryButton.onClick = [this] { showLibraryMenu(); };
+
     resetButton.onClick = [this]
     {
         processor.resetMeasurements();
@@ -960,7 +1114,12 @@ ReferenceABEditor::ReferenceABEditor (ReferenceABProcessor& p)
     };
 
     processor.addChangeListener (this);
-    setSize (960, 720);
+    setWantsKeyboardFocus (true);
+    setResizable (true, true);
+    setResizeLimits (860, 620, 2400, 1600);
+    setSize (juce::jlimit (860, 2400, (int) processor.apvts.state.getProperty ("editorWidth", 960)),
+             juce::jlimit (620, 1600, (int) processor.apvts.state.getProperty ("editorHeight", 720)));
+    constructed = true;
     startTimerHz (30);
 }
 
@@ -1014,8 +1173,16 @@ void ReferenceABEditor::resized()
 
     area.removeFromTop (12);
 
-    auto left = area.removeFromLeft (250);
-    addButton.setBounds (left.removeFromBottom (30));
+    if (constructed)
+    {
+        processor.apvts.state.setProperty ("editorWidth", getWidth(), nullptr);
+        processor.apvts.state.setProperty ("editorHeight", getHeight(), nullptr);
+    }
+
+    auto left = area.removeFromLeft (juce::jlimit (230, 340, getWidth() / 4));
+    auto buttons = left.removeFromBottom (30);
+    libraryButton.setBounds (buttons.removeFromRight (buttons.getWidth() / 2).withTrimmedLeft (4));
+    addButton.setBounds (buttons.withTrimmedRight (4));
     left.removeFromBottom (8);
     trackList.setBounds (left);
 
@@ -1028,7 +1195,8 @@ void ReferenceABEditor::resized()
 
     meters.setBounds (area.removeFromBottom (100));
     area.removeFromBottom (10);
-    analysis.setBounds (area.removeFromBottom (256));
+    // Extra height goes mostly to the analysis views.
+    analysis.setBounds (area.removeFromBottom (juce::jmax (200, 256 + juce::roundToInt ((float) (getHeight() - 720) * 0.65f))));
     area.removeFromBottom (10);
 
     auto controls = area.removeFromBottom (30);
@@ -1077,6 +1245,94 @@ void ReferenceABEditor::filesDropped (const juce::StringArray& files, int x, int
     repaint();
 }
 
+void ReferenceABEditor::setParameter (const juce::String& id, float plainValue)
+{
+    if (auto* parameter = processor.apvts.getParameter (id))
+    {
+        parameter->beginChangeGesture();
+        parameter->setValueNotifyingHost (parameter->convertTo0to1 (plainValue));
+        parameter->endChangeGesture();
+    }
+}
+
+void ReferenceABEditor::toggleParameter (const juce::String& id)
+{
+    if (auto* value = processor.apvts.getRawParameterValue (id))
+        setParameter (id, value->load() > 0.5f ? 0.0f : 1.0f);
+}
+
+bool ReferenceABEditor::keyPressed (const juce::KeyPress& key)
+{
+    if (key.getModifiers().isAnyModifierKeyDown())
+        return false;       // leave shortcuts with Ctrl/Cmd/Alt to the host
+
+    const auto character = juce::CharacterFunctions::toLowerCase (key.getTextCharacter());
+
+    if (character == 'a')       { setParameter ("ab", 0.0f); return true; }
+    if (character == 'b')       { setParameter ("ab", 1.0f); return true; }
+    if (character == 'l')       { toggleParameter ("loop"); return true; }
+    if (character == 'm')       { toggleParameter ("mono"); return true; }
+
+    if (character >= '1' && character <= '8')
+    {
+        processor.selectSlot ((int) (character - '1'));
+        return true;
+    }
+
+    return false;
+}
+
+void ReferenceABEditor::showLibraryMenu()
+{
+    const auto paths = ReferenceLibrary::load();
+    juce::PopupMenu menu, removeMenu;
+
+    if (paths.isEmpty())
+    {
+        menu.addItem (1, "The library is empty. Songs you add are remembered here.", false);
+    }
+    else
+    {
+        menu.addSectionHeader ("Load into the plugin");
+
+        for (int i = 0; i < paths.size(); ++i)
+        {
+            const juce::File file (paths[i]);
+            const bool exists = file.existsAsFile();
+            menu.addItem (1 + i, file.getFileNameWithoutExtension() + (exists ? "" : "  (file missing)"), exists);
+            removeMenu.addItem (10001 + i, file.getFileNameWithoutExtension());
+        }
+
+        menu.addSeparator();
+        menu.addSubMenu ("Remove from library", removeMenu);
+    }
+
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (libraryButton),
+                        [safeThis = juce::Component::SafePointer<ReferenceABEditor> (this), paths] (int result)
+                        {
+                            if (safeThis == nullptr || result <= 0)
+                                return;
+
+                            if (result > 10000)
+                            {
+                                ReferenceLibrary::remove (paths[result - 10001]);
+                                return;
+                            }
+
+                            const juce::File file (paths[result - 1]);
+                            int slot = safeThis->processor.addFile (file);
+
+                            if (slot < 0)
+                            {
+                                // All slots are in use: replace the selected one.
+                                slot = safeThis->processor.getSelectedSlot();
+                                safeThis->processor.loadFile (slot, file);
+                            }
+
+                            safeThis->processor.selectSlot (slot);
+                        });
+}
+
 void ReferenceABEditor::addFiles (const juce::StringArray& paths, int preferredSlot)
 {
     int firstLoaded = -1;
@@ -1104,6 +1360,8 @@ void ReferenceABEditor::addFiles (const juce::StringArray& paths, int preferredS
 
         if (slot < 0)
             break;      // all eight slots are full
+
+        ReferenceLibrary::add (file);
 
         if (firstLoaded < 0)
             firstLoaded = slot;
