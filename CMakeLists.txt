@@ -22,7 +22,7 @@ FetchContent_MakeAvailable(JUCE)
 
 juce_add_plugin(ReferenceAB
     PRODUCT_NAME "Reference AB"
-    COMPANY_NAME "ReferenceAB"
+    COMPANY_NAME "AMV"
     BUNDLE_ID "com.referenceab.plugin"
     PLUGIN_MANUFACTURER_CODE Rfab
     PLUGIN_CODE Rfa1
